@@ -1,0 +1,27 @@
+name: photo_map_album
+description: Photo map demo with permission, batch exif, clustering
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # 只保留一份，建议用较新的
+  google_maps_flutter: ^2.9.0
+
+  # 需要读取相册 & EXIF
+  photo_manager: ^3.0.0
+  exif: ^3.3.0
+
+  # 可选：如果你要用到额外的运行时权限（比如定位），保留它
+  permission_handler: ^11.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
