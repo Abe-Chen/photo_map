@@ -2,10 +2,14 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart' as gmaps;
+import 'package:google_maps_flutter/google_maps_flutter.dart' show BitmapDescriptor;
 import 'package:photo_manager/photo_manager.dart' as pm;
 import 'package:permission_handler/permission_handler.dart';
 
 import 'services/photo_indexer.dart';
+import 'services/permission_manager.dart';
+import 'widgets/ui_utils.dart';
+import 'screens/photo_viewer.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -37,56 +41,98 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   final PhotoIndexModel _model = PhotoIndexModel();
+  final PermissionManager _permissionManager = PermissionManager();
 
   gmaps.GoogleMapController? _mapController;
   final Set<gmaps.Marker> _markers = {};
   bool _mapMyLocationEnabled = false;
   bool _loading = true;
   String? _error;
+  bool _permissionGranted = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _model.addListener(_onModelChanged);
     _bootstrap();
+  }
+  
+  void _onModelChanged() {
+    setState(() {});
+    
+    // 如果索引刚完成且有新的点位，自动重建标记
+    if (!_model.isIndexing && _model.points.isNotEmpty && _markers.isEmpty) {
+      debugPrint('索引完成，自动重建地图标记');
+      _rebuildMarkers();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _model.removeListener(_onModelChanged);
+    _model.stopChangeNotify(); // 停止媒体库变更监听
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      // 应用恢复时进行轻量增量刷新
+      _model.rebuildRecent(minutes: 2);
+      // 同时检查权限状态
+      _checkPermissionsAndRefresh();
+    }
+  }
+
+  /// 检查权限状态并在需要时刷新
+  Future<void> _checkPermissionsAndRefresh() async {
+    final status = await _permissionManager.checkCurrentPermissionStatus();
+    
+    // 如果权限状态发生变化，重新初始化
+    if (status.hasRequiredPermissions != _permissionGranted) {
+      debugPrint('权限状态变化，重新初始化: ${status.hasRequiredPermissions}');
+      await _bootstrap();
+    }
   }
 
   Future<void> _bootstrap() async {
     try {
-      // 1) 申请相册权限（含 ACCESS_MEDIA_LOCATION）
-      final pm.PermissionState ps = await pm.PhotoManager.requestPermissionExtend();
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
 
-// 兼容 3.x：hasAccess 为 true 时表示“可访问”（含 Limited）；isAuth 为 true 表示“完全授权”
-      final bool galleryGranted =
-          (ps.isAuth == true) || (ps.hasAccess == true);
-
-// 受限访问下继续索引，但给个温和提示（不阻断）
-      if (!galleryGranted) {
+      // 1) 使用新的权限管理器申请相册权限
+      final bool permissionGranted = await _permissionManager.ensureMediaPermissions();
+      _permissionGranted = permissionGranted;
+      
+      if (!permissionGranted) {
         setState(() {
           _loading = false;
-          _error = '相册访问权限未授予，请在系统设置中开启。';
+          _error = '相册访问权限未授予，请在系统设置中开启后返回应用。';
         });
         return;
-      } else {
-        // 如果是受限访问，可以提示一下（不必中断）
-        if (ps.isAuth != true && ps.hasAccess == true) {
-          debugPrint('相册为“受限访问”，只会索引你授予的那部分照片。');
-        }
       }
 
-
-      // 2) 申请前台定位权限（用于地图“我的位置”小蓝点，可选）
+      // 2) 申请前台定位权限（用于地图"我的位置"小蓝点，可选）
       final status = await Permission.locationWhenInUse.request();
       _mapMyLocationEnabled = status.isGranted;
 
-      // 3) 构建照片索引（含 EXIF 兜底）
+      // 3) 权限获取成功后立即构建照片索引
       await _model.buildIndex();
+      
+      // 4) 启动媒体库变更监听
+      await _model.startChangeNotify();
 
-      // 4) 把点位转成 Marker
-      _rebuildMarkers();
+      // 5) 把点位转成 Marker
+      await _rebuildMarkers();
 
-      // 5) 如有点位，移动相机
+      // 6) 如有点位，移动相机
       if (_model.points.isNotEmpty && _mapController != null) {
         final first = _model.points.first;
         unawaited(_mapController!.animateCamera(
@@ -111,43 +157,74 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  void _rebuildMarkers() {
+  Future<void> _rebuildMarkers() async {
+    debugPrint('=== 开始重建地图标记，共 ${_model.points.length} 个点位 ===');
     _markers.clear();
-    for (final p in _model.points) {
-      _markers.add(
-        gmaps.Marker(
-          markerId: gmaps.MarkerId(p.id),
-          position: gmaps.LatLng(p.lat, p.lng),
-          infoWindow: gmaps.InfoWindow(
-            title: p.date?.toLocal().toString() ?? '无时间信息',
+    
+    for (int i = 0; i < _model.points.length; i++) {
+      final p = _model.points[i];
+      try {
+        // 获取照片缩略图
+        final thumbnailBytes = await _model.getThumbnail(p.id);
+        
+        // 如果有缩略图，使用缩略图作为标记；否则使用默认标记
+        final BitmapDescriptor icon = thumbnailBytes != null 
+            ? await bitmapFromBytes(thumbnailBytes, circle: true, target: 120)
+            : BitmapDescriptor.defaultMarker;
+        
+        _markers.add(
+          gmaps.Marker(
+            markerId: gmaps.MarkerId(p.id),
+            position: gmaps.LatLng(p.lat, p.lng),
+            icon: icon,
+            onTap: () {
+              // 点击标记时打开照片查看器
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (context) => PhotoViewer(asset: p.asset!),
+                ),
+              );
+            },
           ),
-        ),
-      );
+        );
+        
+        // 每处理100个标记输出一次进度
+        if ((i + 1) % 100 == 0) {
+          debugPrint('已处理 ${i + 1}/${_model.points.length} 个标记');
+        }
+      } catch (e) {
+        debugPrint('处理标记失败 ${p.id}: $e');
+        // 即使单个标记失败，也继续处理其他标记
+      }
     }
+    
+    debugPrint('=== 标记重建完成，共生成 ${_markers.length} 个标记 ===');
     setState(() {});
   }
 
   Future<void> _onRefresh() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    await _model.rebuild();
-    _rebuildMarkers();
-    setState(() {
-      _loading = false;
-      _error = _model.error;
-    });
-
-    if (_model.points.isNotEmpty && _mapController != null) {
-      final first = _model.points.first;
-      unawaited(_mapController!.animateCamera(
-        gmaps.CameraUpdate.newLatLngZoom(
-          gmaps.LatLng(first.lat, first.lng),
-          13,
-        ),
-      ));
+    // 重新执行完整的初始化流程，包括权限检查
+    await _bootstrap();
+  }
+  
+  String _getStatusText() {
+    if (_model.isIndexing) {
+      if (_model.total > 0) {
+        return '正在扫描相册… (${_model.indexedCount}/${_model.total})';
+      } else {
+        return '正在扫描相册…';
+      }
     }
+    
+    if (_model.lastError != null) {
+      return _model.lastError!;
+    }
+    
+    if (_error != null) {
+      return _error!;
+    }
+    
+    return '共 ${_model.total} 张照片，含定位 ${_model.points.length} 张';
   }
 
   @override
@@ -193,45 +270,58 @@ class _MyHomePageState extends State<MyHomePage> {
               ),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Expanded(
-                      child: Text(
-                        _loading
-                            ? '正在索引照片…'
-                            : _error != null
-                            ? _error!
-                            : '共 ${_model.total} 张照片，含定位 ${_model.points.length} 张',
-                        style: const TextStyle(color: Colors.white),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _getStatusText(),
+                            style: const TextStyle(color: Colors.white),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        if (_model.isIndexing)
+                          const SizedBox(
+                            height: 18,
+                            width: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                            ),
+                          ),
+                      ],
                     ),
-                    const SizedBox(width: 8),
-                    if (_loading)
-                      const SizedBox(
-                        height: 18,
-                        width: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                    // 索引进度条
+                    if (_model.isIndexing && _model.total > 0)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Column(
+                          children: [
+                            LinearProgressIndicator(
+                              value: _model.indexedCount / _model.total,
+                              backgroundColor: Colors.white.withOpacity(0.3),
+                              valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${_model.indexedCount} / ${_model.total}',
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                   ],
                 ),
               ),
             ),
           ),
-
-          // 无数据时的友好提示
-          if (!_loading && _error == null && !hasPoints)
-            Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
-                child: Text(
-                  '没有发现带经纬度的照片。\n可能是拍照时关闭了“位置标签”，或图片来自下载/截图。',
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.bodyLarge,
-                ),
-              ),
-            ),
         ],
       ),
 

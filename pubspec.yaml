@@ -17,6 +17,36 @@ dependencies:
 
   # 可选：如果你要用到额外的运行时权限（比如定位），保留它
   permission_handler: ^11.3.1
+  
+  # 用于检测Android版本
+  device_info_plus: ^10.1.0
+  
+  # 地图聚类
+  supercluster: ^3.1.0
+  
+  # 状态管理
+  provider: ^6.1.2
+  
+  # 持久化缓存管理
+  flutter_cache_manager: ^3.3.1
+  
+  # 本地存储
+  shared_preferences: ^2.2.2
+  
+  # SQLite数据库
+  sqflite: ^2.3.0
+  
+  # 分享功能
+  share_plus: ^7.2.2
+  
+  # 文件路径管理
+  path_provider: ^2.1.1
+  
+  # 逆地理编码
+  geocoding: ^3.0.0
+  
+  # 国际化和日期格式化
+  intl: ^0.19.0
 
 dev_dependencies:
   flutter_test:
